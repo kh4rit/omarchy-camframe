@@ -7,7 +7,7 @@ display, for any USB webcam on [Omarchy](https://omarchy.org).
 the real one. A bar widget shows the whole camera image with the framed area
 outlined: drag the frame to move it, scroll or use the slider to zoom.
 
-![Camera framing widget](screenshot.png)
+![Camera framing widget](preview.png)
 
 - **Works with locked cameras.** Many webcams, including the Apple Studio Display
   camera, don't let Linux control zoom or pan. The crop happens in software, so
