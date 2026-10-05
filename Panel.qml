@@ -31,10 +31,13 @@ Panel {
   property bool serviceUp: false
   property bool noCamera: false
   property string label: "Framed Camera"
-  property string cameraName: ""
   property string selectedCamera: "auto"
   property var cameras: []
-  readonly property var cameraOptions: [{ value: "auto", label: "Automatic" }].concat(
+  // "auto" means the first connected camera; name it so the choice is clear.
+  readonly property var cameraOptions: [{
+    value: "auto",
+    label: cameras.length ? "Automatic (" + cameras[0].name + ")" : "Automatic"
+  }].concat(
     cameras.map(function(c) { return { value: c.path, label: c.name } }))
   property real zoom: 1.0
   property real cx: 0.5
@@ -108,7 +111,6 @@ Panel {
         root.live = st.state === "live"
         root.noCamera = st.state === "nocamera"
         if (st.label) root.label = st.label
-        root.cameraName = st.camera || ""
         root.selectedCamera = st.selected || "auto"
         root.cameras = st.cameras || []
       } catch (e) {
@@ -322,8 +324,7 @@ Panel {
         width: parent.width
         wrapMode: Text.WordWrap
         text: root.serviceUp
-          ? (root.cameraName && root.cameras.length > 1 ? "Using " + root.cameraName + ". " : "")
-            + "Drag to move · scroll to zoom · double-click to reset. Select “" + root.label + "” as the camera in your call app."
+          ? "Drag to move · scroll to zoom · double-click to reset. Select “" + root.label + "” as the camera in your call app."
           : "Run “camframe setup” in a terminal (see the plugin README), then reopen this panel."
         color: root.dim
         font.family: root.fontFamily
