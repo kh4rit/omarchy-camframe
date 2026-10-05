@@ -9,6 +9,8 @@ preview), so the camera light behaves like it does without camframe.
   camframe setup                 one-time install (asks for sudo for the root steps)
   camframe doctor                show what camframe detected and what to fix
   camframe start | stop | toggle | status
+  camframe cameras               list connected cameras (* = in use)
+  camframe use N|PATH|auto       choose the camera (auto = first connected)
   camframe zoom in|out|reset
   camframe pan left|right|up|down
   camframe reset                 full field of view, centered
@@ -17,6 +19,7 @@ preview), so the camera light behaves like it does without camframe.
 
 Optional config in ~/.config/camframe/config.json, e.g.
   {"camera": "/dev/v4l/by-id/usb-...-video-index0", "mode": "1280x720"}
+If the chosen camera is unplugged, the first connected camera is used.
 """
 import ctypes, fcntl, glob, json, os, re, select, shutil, signal, subprocess, sys, time
 
@@ -51,12 +54,16 @@ V4L2_EVENT_PRI_CLIENT_USAGE = 0x08000000 + 0x08E00000 + 1   # v4l2loopback >= 0.
 
 # --- configuration and device discovery -------------------------------------
 
-def config():
+def read_config_file():
     try:
         with open(CONFIG) as f:
-            cfg = json.load(f)
+            return json.load(f)
     except FileNotFoundError:
-        cfg = {}
+        return {}
+
+
+def config():
+    cfg = read_config_file()
     env = {"camera": "CAMFRAME_CAMERA", "mode": "CAMFRAME_MODE",
            "output": "CAMFRAME_OUTPUT", "loopback": "CAMFRAME_LOOPBACK", "label": "CAMFRAME_LABEL"}
     for key, var in env.items():
@@ -73,12 +80,34 @@ def video_name(dev):
         return "?"
 
 
+def camera_name(dev):
+    """USB product name ("Logitech BRIO"), else the V4L2 card name."""
+    node = os.path.basename(os.path.realpath(dev))
+    usb = os.path.realpath(f"/sys/class/video4linux/{node}/device/..")
+    try:
+        with open(f"{usb}/product") as f:
+            return f.read().strip() or video_name(dev)
+    except OSError:
+        return video_name(dev)
+
+
+def list_cameras():
+    """[{path, name}] of connected cameras; by-id only lists real (USB) ones."""
+    cams, seen = [], {}
+    for path in sorted(glob.glob("/dev/v4l/by-id/*-video-index0")):
+        name = camera_name(path)
+        seen[name] = seen.get(name, 0) + 1
+        cams.append({"path": path, "name": name if seen[name] == 1 else f"{name} ({seen[name]})"})
+    return cams
+
+
 def find_camera(cfg):
-    if cfg.get("camera"):
-        return cfg["camera"]
-    # by-id only lists real (USB) cameras; index0 is the capture node
-    cams = sorted(glob.glob("/dev/v4l/by-id/*-video-index0"))
-    return cams[0] if cams else None
+    """The chosen camera if it's connected, else the first connected one."""
+    want = cfg.get("camera")
+    if want and want != "auto" and os.path.exists(want):
+        return want
+    cams = list_cameras()
+    return cams[0]["path"] if cams else None
 
 
 def find_loopback(cfg):
@@ -125,21 +154,30 @@ def pick_mode(dev, cfg):
 class Setup:
     """Resolved devices and geometry for this run."""
 
-    def __init__(self):
-        cfg = config()
-        self.src = find_camera(cfg)
+    def __init__(self, probe=True):
+        self.cfg = cfg = config()
         self.dst = find_loopback(cfg)
         self.label = video_name(self.dst) if self.dst else cfg.get("label", DEFAULT_LABEL)
-        if self.src:
-            self.fmt, self.in_w, self.in_h = pick_mode(self.src, cfg)
-        else:
-            self.fmt, self.in_w, self.in_h = "mjpeg", 1920, 1080
         self.out_w, self.out_h = map(int, cfg.get("output", "1280x720").split("x"))
         self.frame = self.out_w * self.out_h * 3 // 2           # yuv420p
+        self.src, self.fmt = None, "mjpeg"
+        self.set_mode(1920, 1080)
+        if probe:
+            self.use_camera(find_camera(cfg))
+
+    def use_camera(self, src):
+        """Switch to `src` (or None), probing its best capture mode."""
+        self.src = src
+        if src:
+            self.fmt, w, h = pick_mode(src, self.cfg)
+            self.set_mode(w, h)
+
+    def set_mode(self, w, h):
+        self.in_w, self.in_h = w, h
         # largest window with the output's aspect ratio inside the camera image
         aspect = self.out_w / self.out_h
-        self.full_w = min(self.in_w, round(self.in_h * aspect)) // 2 * 2
-        self.full_h = min(self.in_h, round(self.in_w / aspect)) // 2 * 2
+        self.full_w = min(w, round(h * aspect)) // 2 * 2
+        self.full_h = min(h, round(w / aspect)) // 2 * 2
 
     def geometry(self, s):
         z = min(max(s["zoom"], ZOOM_MIN), ZOOM_MAX)
@@ -281,19 +319,24 @@ def preview_requested():
         return False
 
 
-def write_status(setup, state):
+def write_status(setup, state, cameras):
+    """Shared with the widget: state, the camera in use and the ones to pick from."""
+    chosen = read_config_file().get("camera", "auto")
+    status = {"state": state, "label": setup.label,
+              "camera": camera_name(setup.src) if setup.src else "",
+              "camera_path": setup.src or "", "mode": f"{setup.in_w}x{setup.in_h}",
+              "selected": chosen if chosen != "auto" and os.path.exists(chosen) else "auto",
+              "cameras": cameras}
     tmp = STATUS + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"state": state, "label": setup.label, "camera": video_name(setup.src),
-                   "mode": f"{setup.in_w}x{setup.in_h}"}, f)
+        json.dump(status, f)
     os.replace(tmp, STATUS)
+    return status
 
 
 def run():
     """Own the virtual camera; open the real one only while someone reads."""
-    setup = Setup()
-    if not setup.src:
-        sys.exit("camframe: no USB camera found (see `camframe doctor`)")
+    setup = Setup(probe=False)
     if not setup.dst:
         sys.exit("camframe: virtual camera not found - run `camframe setup` (see `camframe doctor`)")
     os.makedirs(RUNDIR, exist_ok=True)
@@ -308,6 +351,14 @@ def run():
     last_wanted = 0.0
     retry_at = 0.0
     pending = b""
+    cameras = list_cameras()
+    state = "idle"
+    last_scan = 0.0
+
+    def set_state(new):
+        nonlocal state
+        state = new
+        write_status(setup, state, cameras)
 
     def stop_cam():
         nonlocal cam, pending
@@ -319,20 +370,38 @@ def run():
             except subprocess.TimeoutExpired:
                 cam.kill()
             cam, pending = None, b""
-            write_status(setup, "idle")
+            set_state("idle")
 
-    write_status(setup, "idle")
+    set_state("idle")
     try:
         while True:
             now = time.monotonic()
             wanted = streaming or preview_requested()
             if wanted:
                 last_wanted = now
+            # Hotplug and camera choice: rescan once a second.
+            if now - last_scan >= 1.0:
+                last_scan = now
+                scan = list_cameras()
+                want = find_camera(config())
+                if cam and want != setup.src:
+                    stop_cam()          # chosen camera changed or unplugged; restart below
+                if scan != cameras or (not cam and want != setup.src):
+                    cameras = scan
+                    if not cam:
+                        setup.use_camera(want)
+                    set_state("nocamera" if not want else state if cam else "idle")
             if wanted and not cam and now >= retry_at:
-                cam = subprocess.Popen(camera_cmd(setup), stdout=subprocess.PIPE)
-                os.set_blocking(cam.stdout.fileno(), False)
-                poller.register(cam.stdout, select.POLLIN | select.POLLHUP)
-                write_status(setup, "live")
+                setup.use_camera(find_camera(config()))
+                if setup.src:
+                    cam = subprocess.Popen(camera_cmd(setup), stdout=subprocess.PIPE)
+                    os.set_blocking(cam.stdout.fileno(), False)
+                    poller.register(cam.stdout, select.POLLIN | select.POLLHUP)
+                    set_state("live")
+                else:
+                    retry_at = now + 1
+                    if state != "nocamera":
+                        set_state("nocamera")
             if not wanted and cam and now - last_wanted >= IDLE_GRACE:
                 stop_cam()
 
@@ -445,7 +514,10 @@ def usb_path(sysdev):
 def doctor():
     s = Setup()
     ok = lambda b: "ok  " if b else "FAIL"
-    print(f"[{ok(s.src)}] camera:   {s.src or 'none found'}" + (f"  ({video_name(s.src)})" if s.src else ""))
+    print(f"[{ok(s.src)}] camera:   {camera_name(s.src) + '  ' + s.src if s.src else 'none found'}")
+    others = [c["name"] for c in list_cameras() if c["path"] != s.src]
+    if others:
+        print(f"       also:     {', '.join(others)}  (switch with `camframe use`)")
     if s.src:
         print(f"       mode:     {s.fmt} {s.in_w}x{s.in_h} -> {s.out_w}x{s.out_h}")
     print(f"[{ok(s.dst)}] virtual:  {s.dst or 'not found - run `camframe setup`'}" + (f"  ({s.label})" if s.dst else ""))
@@ -484,6 +556,18 @@ def doctor():
 
 # --- CLI ---------------------------------------------------------------------
 
+def cli_setup():
+    """Geometry for framing commands: the live camera's mode, without probing it."""
+    s = Setup(probe=False)
+    try:
+        with open(STATUS) as f:
+            w, h = map(int, json.load(f)["mode"].split("x"))
+        s.set_mode(w, h)
+    except Exception:
+        s.use_camera(find_camera(s.cfg))
+    return s
+
+
 def main(argv):
     cmd = argv[0] if argv else "status"
     arg = argv[1] if len(argv) > 1 else ""
@@ -504,13 +588,33 @@ def main(argv):
     elif cmd == "status":
         st = load()
         print(f"{'running' if running() else 'stopped'}  zoom={st['zoom']:.2f} "
-              f"center=({st['cx']:.2f},{st['cy']:.2f}) crop={Setup().geometry(st)}")
+              f"center=({st['cx']:.2f},{st['cy']:.2f}) crop={cli_setup().geometry(st)}")
+    elif cmd == "cameras":
+        current = find_camera(config())
+        for i, c in enumerate(list_cameras(), 1):
+            print(f"{'*' if c['path'] == current else ' '} {i}  {c['name']}  {c['path']}")
+    elif cmd == "use":
+        cams = list_cameras()
+        if arg.isdigit() and 1 <= int(arg) <= len(cams):
+            arg = cams[int(arg) - 1]["path"]
+        if arg != "auto" and not os.path.exists(arg):
+            sys.exit(f"camframe: no camera {arg!r}; see `camframe cameras`")
+        cfg = read_config_file()
+        if arg == "auto":
+            cfg.pop("camera", None)
+        else:
+            cfg["camera"] = arg
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        with open(CONFIG + ".tmp", "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(CONFIG + ".tmp", CONFIG)
+        notify(f"Camera: {camera_name(arg) if arg != 'auto' else 'automatic'}")
     elif cmd == "preview":
         os.makedirs(RUNDIR, exist_ok=True)
         with open(PREVIEW_REQ, "a"):
             os.utime(PREVIEW_REQ)
     elif cmd in ("set", "zoom", "pan", "reset"):
-        setup = Setup()
+        setup = cli_setup()
         old = load()
         new = dict(old)
         if cmd == "set":

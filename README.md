@@ -48,6 +48,22 @@ camframe doctor
 | Bar widget | Click the camera icon. Drag the frame to move it, scroll to zoom, double-click to reset. Middle-click the icon to reset. |
 | Terminal | `camframe zoom in`, `camframe zoom out`, `camframe pan left`, `camframe reset`, `camframe set 1.5 0.5 0.4` |
 
+### Several cameras
+
+"Framed Camera" keeps its name whichever real camera feeds it, so call apps stay
+on it when you switch. With more than one camera connected, the widget shows a
+camera picker above the preview; from a terminal:
+
+```bash
+camframe cameras        # list them, * marks the one in use
+camframe use 2          # pick by number (or by /dev/v4l/by-id path)
+camframe use auto       # first connected camera
+```
+
+Switching takes effect immediately, even mid-call. Plug and unplug freely: if
+the chosen camera is missing, camframe uses the first connected one and returns
+to your choice when it's back. Zoom and position carry over between cameras.
+
 The icon turns red while the camera is live. The widget preview is mirrored like
 a self-view (turn off **Mirror preview** in the widget settings); people on the
 call see the normal, unmirrored image.
@@ -85,7 +101,7 @@ Everything is detected automatically. To override, create
 
 | Key | Default | Meaning |
 |---|---|---|
-| `camera` | first camera in `/dev/v4l/by-id` | Which real camera to crop |
+| `camera` | first connected camera | Which real camera to crop (set by `camframe use` and the widget picker) |
 | `mode` | largest 16:9 MJPEG mode up to 1920×1080 | Capture size from the real camera |
 | `output` | `1280x720` | Size of the virtual camera |
 | `label` | `Framed Camera` | Name of the virtual camera to use |

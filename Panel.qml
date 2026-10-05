@@ -29,7 +29,13 @@ Panel {
 
   property bool live: false
   property bool serviceUp: false
+  property bool noCamera: false
   property string label: "Framed Camera"
+  property string cameraName: ""
+  property string selectedCamera: "auto"
+  property var cameras: []
+  readonly property var cameraOptions: [{ value: "auto", label: "Automatic" }].concat(
+    cameras.map(function(c) { return { value: c.path, label: c.name } }))
   property real zoom: 1.0
   property real cx: 0.5
   property real cy: 0.5
@@ -100,7 +106,11 @@ Panel {
         var st = JSON.parse(text())
         root.serviceUp = true
         root.live = st.state === "live"
+        root.noCamera = st.state === "nocamera"
         if (st.label) root.label = st.label
+        root.cameraName = st.camera || ""
+        root.selectedCamera = st.selected || "auto"
+        root.cameras = st.cameras || []
       } catch (e) {
         root.serviceUp = false
         root.live = false
@@ -177,10 +187,27 @@ Panel {
         Text {
           anchors.right: parent.right
           anchors.verticalCenter: title.verticalCenter
-          text: !root.serviceUp ? "Service not running" : root.live ? "● Live" : "Starting camera…"
+          text: !root.serviceUp ? "Service not running"
+            : root.noCamera ? "No camera connected"
+            : root.live ? "● Live" : "Starting camera…"
           color: root.live ? root.accent : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
+        }
+      }
+
+      Dropdown {
+        id: cameraPicker
+        visible: root.cameras.length > 1
+        width: parent.width
+        showLabel: false
+        options: root.cameraOptions
+        value: root.selectedCamera
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onChanged: function(value) {
+          root.selectedCamera = value
+          Quickshell.execDetached([root.camframe, "use", value])
         }
       }
 
@@ -295,7 +322,8 @@ Panel {
         width: parent.width
         wrapMode: Text.WordWrap
         text: root.serviceUp
-          ? "Drag to move · scroll to zoom · double-click to reset. Select “" + root.label + "” as the camera in your call app."
+          ? (root.cameraName && root.cameras.length > 1 ? "Using " + root.cameraName + ". " : "")
+            + "Drag to move · scroll to zoom · double-click to reset. Select “" + root.label + "” as the camera in your call app."
           : "Run “camframe setup” in a terminal (see the plugin README), then reopen this panel."
         color: root.dim
         font.family: root.fontFamily
