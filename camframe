@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""camframe - software zoom and pan ("framing") for any USB webcam.
+
+Crops the real camera with ffmpeg and publishes the result as a v4l2loopback
+virtual camera ("Framed Camera"). The real camera is only opened while an app
+is actually streaming from the virtual one (or the bar widget shows its
+preview), so the camera light behaves like it does without camframe.
+
+  camframe setup                 one-time install (asks for sudo for the root steps)
+  camframe doctor                show what camframe detected and what to fix
+  camframe start | stop | toggle | status
+  camframe zoom in|out|reset
+  camframe pan left|right|up|down
+  camframe reset                 full field of view, centered
+  camframe set ZOOM CX CY        absolute framing (CX/CY 0..1)
+  camframe preview               keep the camera open ~2.5s for the widget preview
+
+Optional config in ~/.config/camframe/config.json, e.g.
+  {"camera": "/dev/v4l/by-id/usb-...-video-index0", "mode": "1280x720"}
+"""
+import ctypes, fcntl, glob, json, os, re, select, shutil, signal, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "camframe", "config.json")
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local", "state")), "camframe", "state.json")
+RUNDIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "camframe")
+PREVIEW = os.path.join(RUNDIR, "preview.jpg")          # full camera view, for the bar widget
+PREVIEW_REQ = os.path.join(RUNDIR, "preview-request")  # touched by the widget while open
+STATUS = os.path.join(RUNDIR, "status")                # {"state": "live"|"idle", ...}
+UNIT = "camframe"
+SCRIPT = os.path.realpath(__file__)
+
+DEFAULT_LABEL = "Framed Camera"
+MAX_MODE = (1920, 1080)        # larger modes reserve a lot of isochronous USB bandwidth
+ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 1.0, 3.0, 1.15
+PAN_STEP = 0.06                # fraction of the frame per keypress
+IDLE_GRACE = 3.0               # seconds without readers before the camera closes
+PREVIEW_HOLD = 2.5             # a preview request keeps the camera open this long
+ZMQ_ADDR = "tcp://127.0.0.1:5561"
+DEFAULT = {"zoom": 1.0, "cx": 0.5, "cy": 0.5}
+
+# V4L2 ioctls (x86_64 / aarch64)
+VIDIOC_S_FMT = 0xc0d05605
+VIDIOC_SUBSCRIBE_EVENT = 0x4020565a
+VIDIOC_DQEVENT = 0x80885659
+V4L2_BUF_TYPE_VIDEO_OUTPUT = 2
+V4L2_PIX_FMT_YUV420 = int.from_bytes(b"YU12", "little")
+V4L2_EVENT_SUB_FL_SEND_INITIAL = 1
+V4L2_EVENT_PRI_CLIENT_USAGE = 0x08000000 + 0x08E00000 + 1   # v4l2loopback >= 0.13
+
+
+# --- configuration and device discovery -------------------------------------
+
+def config():
+    try:
+        with open(CONFIG) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        cfg = {}
+    env = {"camera": "CAMFRAME_CAMERA", "mode": "CAMFRAME_MODE",
+           "output": "CAMFRAME_OUTPUT", "loopback": "CAMFRAME_LOOPBACK", "label": "CAMFRAME_LABEL"}
+    for key, var in env.items():
+        if os.environ.get(var):
+            cfg[key] = os.environ[var]
+    return cfg
+
+
+def video_name(dev):
+    try:
+        with open(f"/sys/class/video4linux/{os.path.basename(os.path.realpath(dev))}/name") as f:
+            return f.read().strip()
+    except OSError:
+        return "?"
+
+
+def find_camera(cfg):
+    if cfg.get("camera"):
+        return cfg["camera"]
+    # by-id only lists real (USB) cameras; index0 is the capture node
+    cams = sorted(glob.glob("/dev/v4l/by-id/*-video-index0"))
+    return cams[0] if cams else None
+
+
+def find_loopback(cfg):
+    if cfg.get("loopback"):
+        return cfg["loopback"]
+    label = cfg.get("label", DEFAULT_LABEL)
+    for d in sorted(glob.glob("/sys/class/video4linux/video*")):
+        dev = "/dev/" + os.path.basename(d)
+        if "/virtual/" in os.path.realpath(d) and video_name(dev) == label:
+            return dev
+    return None
+
+
+def camera_modes(dev):
+    """[(fourcc, w, h)] from v4l2-ctl --list-formats-ext."""
+    out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats-ext"],
+                         capture_output=True, text=True).stdout
+    modes, fourcc = [], None
+    for line in out.splitlines():
+        m = re.search(r"\[\d+\]: '(\w+)'", line)
+        if m:
+            fourcc = m.group(1)
+        m = re.search(r"Size: Discrete (\d+)x(\d+)", line)
+        if m and fourcc:
+            modes.append((fourcc, int(m.group(1)), int(m.group(2))))
+    return modes
+
+
+def pick_mode(dev, cfg):
+    """(input_format, w, h): the largest 16:9 MJPEG mode up to MAX_MODE."""
+    if cfg.get("mode"):
+        w, h = map(int, cfg["mode"].split("x"))
+        return cfg.get("input_format", "mjpeg"), w, h
+    modes = camera_modes(dev)
+    for fmt, ffname, cap in (("MJPG", "mjpeg", MAX_MODE), ("YUYV", "yuyv422", (1280, 720))):
+        cands = [(w, h) for f, w, h in modes if f == fmt and w <= cap[0] and h <= cap[1]]
+        wide = [(w, h) for w, h in cands if abs(w / h - 16 / 9) < 0.02]
+        best = max(wide or cands, key=lambda m: m[0] * m[1], default=None)
+        if best:
+            return ffname, best[0], best[1]
+    return "mjpeg", 1280, 720
+
+
+class Setup:
+    """Resolved devices and geometry for this run."""
+
+    def __init__(self):
+        cfg = config()
+        self.src = find_camera(cfg)
+        self.dst = find_loopback(cfg)
+        self.label = video_name(self.dst) if self.dst else cfg.get("label", DEFAULT_LABEL)
+        if self.src:
+            self.fmt, self.in_w, self.in_h = pick_mode(self.src, cfg)
+        else:
+            self.fmt, self.in_w, self.in_h = "mjpeg", 1920, 1080
+        self.out_w, self.out_h = map(int, cfg.get("output", "1280x720").split("x"))
+        self.frame = self.out_w * self.out_h * 3 // 2           # yuv420p
+        # largest window with the output's aspect ratio inside the camera image
+        aspect = self.out_w / self.out_h
+        self.full_w = min(self.in_w, round(self.in_h * aspect)) // 2 * 2
+        self.full_h = min(self.in_h, round(self.in_w / aspect)) // 2 * 2
+
+    def geometry(self, s):
+        z = min(max(s["zoom"], ZOOM_MIN), ZOOM_MAX)
+        w = int(self.full_w / z) // 2 * 2
+        h = int(self.full_h / z) // 2 * 2
+        x = int(s["cx"] * self.in_w - w / 2)
+        y = int(s["cy"] * self.in_h - h / 2)
+        x = min(max(x, 0), self.in_w - w) // 2 * 2
+        y = min(max(y, 0), self.in_h - h) // 2 * 2
+        return w, h, x, y
+
+    def clamp_center(self, s):
+        w, h, x, y = self.geometry(s)
+        s["cx"] = (x + w / 2) / self.in_w
+        s["cy"] = (y + h / 2) / self.in_h
+        return s
+
+
+# --- state -------------------------------------------------------------------
+
+def load():
+    try:
+        with open(STATE) as f:
+            return {**DEFAULT, **json.load(f)}
+    except Exception:
+        return dict(DEFAULT)
+
+
+def save(s):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f)
+    os.replace(tmp, STATE)
+
+
+def running():
+    return subprocess.run(["systemctl", "--user", "is-active", "--quiet", UNIT]).returncode == 0
+
+
+def notify(msg):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "Camera", "-t", "1200",
+                        "-h", "string:x-canonical-private-synchronous:camframe",
+                        "Camera framing", msg], check=False)
+
+
+def send(geom):
+    """Push a new crop to the live ffmpeg; False if the camera isn't streaming."""
+    import zmq
+    sock = zmq.Context.instance().socket(zmq.REQ)
+    sock.setsockopt(zmq.RCVTIMEO, 300)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.connect(ZMQ_ADDR)
+    try:
+        for key, val in zip("whxy", geom):
+            sock.send_string(f"crop@cf {key} {val}")
+            sock.recv_string()
+        return True
+    except zmq.Again:
+        return False
+    finally:
+        sock.close()
+
+
+def apply(setup, old, new, animate=True):
+    """Save the new framing and move the live crop to it."""
+    save(new)
+    steps = 6 if animate else 1
+    for i in range(1, steps + 1):
+        t = i / steps
+        mid = {k: old[k] + (new[k] - old[k]) * t for k in DEFAULT}
+        if not send(setup.geometry(mid)):
+            return
+        if animate:
+            time.sleep(0.03)
+
+
+# --- service -----------------------------------------------------------------
+
+def open_output(setup):
+    class PixFormat(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint32) for n in (
+            "width", "height", "pixelformat", "field", "bytesperline", "sizeimage",
+            "colorspace", "priv", "flags", "ycbcr_enc", "quantization", "xfer_func")]
+
+    class Format(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_uint32), ("_pad", ctypes.c_uint32),
+                    ("pix", PixFormat), ("_rest", ctypes.c_uint8 * (200 - 48))]
+
+    class Sub(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_uint32), ("id", ctypes.c_uint32),
+                    ("flags", ctypes.c_uint32), ("reserved", ctypes.c_uint32 * 5)]
+
+    fd = os.open(setup.dst, os.O_RDWR | os.O_NONBLOCK)
+    f = Format(type=V4L2_BUF_TYPE_VIDEO_OUTPUT)
+    f.pix = PixFormat(width=setup.out_w, height=setup.out_h, pixelformat=V4L2_PIX_FMT_YUV420,
+                      field=1, bytesperline=setup.out_w, sizeimage=setup.frame)
+    fcntl.ioctl(fd, VIDIOC_S_FMT, f)
+    fcntl.ioctl(fd, VIDIOC_SUBSCRIBE_EVENT,
+                Sub(type=V4L2_EVENT_PRI_CLIENT_USAGE, flags=V4L2_EVENT_SUB_FL_SEND_INITIAL))
+    return fd
+
+
+def readers(fd):
+    """Drain pending usage events; return the latest reader count or None."""
+    buf = ctypes.create_string_buffer(136)
+    count = None
+    while True:
+        try:
+            fcntl.ioctl(fd, VIDIOC_DQEVENT, buf)
+        except OSError:
+            return count
+        if int.from_bytes(buf.raw[0:4], "little") == V4L2_EVENT_PRI_CLIENT_USAGE:
+            count = int.from_bytes(buf.raw[8:12], "little")
+
+
+def camera_cmd(setup):
+    w, h, x, y = setup.geometry(load())
+    addr = ZMQ_ADDR.replace(":", "\\:")
+    fc = (f"[0:v]split=2[m][p];"
+          f"[m]zmq=bind_address='{addr}',"
+          f"crop@cf=w={w}:h={h}:x={x}:y={y},"
+          f"scale={setup.out_w}:{setup.out_h}:flags=bicubic,setsar=1,format=yuv420p[out];"
+          f"[p]fps=8,scale=480:-2[pv]")
+    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+            "-f", "v4l2", "-input_format", setup.fmt,
+            "-video_size", f"{setup.in_w}x{setup.in_h}", "-framerate", "30", "-i", setup.src,
+            "-filter_complex", fc,
+            "-map", "[out]", "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1",
+            "-map", "[pv]", "-f", "image2", "-update", "1", "-atomic_writing", "1",
+            "-q:v", "6", PREVIEW]
+
+
+def preview_requested():
+    try:
+        return time.time() - os.stat(PREVIEW_REQ).st_mtime < PREVIEW_HOLD
+    except FileNotFoundError:
+        return False
+
+
+def write_status(setup, state):
+    tmp = STATUS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"state": state, "label": setup.label, "camera": video_name(setup.src),
+                   "mode": f"{setup.in_w}x{setup.in_h}"}, f)
+    os.replace(tmp, STATUS)
+
+
+def run():
+    """Own the virtual camera; open the real one only while someone reads."""
+    setup = Setup()
+    if not setup.src:
+        sys.exit("camframe: no USB camera found (see `camframe doctor`)")
+    if not setup.dst:
+        sys.exit("camframe: virtual camera not found - run `camframe setup` (see `camframe doctor`)")
+    os.makedirs(RUNDIR, exist_ok=True)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    out = open_output(setup)
+    placeholder = bytes([0x20]) * (setup.out_w * setup.out_h) + bytes([0x80]) * (setup.out_w * setup.out_h // 2)
+    poller = select.poll()
+    poller.register(out, select.POLLPRI)
+    cam = None            # ffmpeg process feeding real frames
+    streaming = False     # an app is streaming from us
+    last_wanted = 0.0
+    retry_at = 0.0
+    pending = b""
+
+    def stop_cam():
+        nonlocal cam, pending
+        if cam:
+            poller.unregister(cam.stdout)
+            cam.terminate()
+            try:
+                cam.wait(2)
+            except subprocess.TimeoutExpired:
+                cam.kill()
+            cam, pending = None, b""
+            write_status(setup, "idle")
+
+    write_status(setup, "idle")
+    try:
+        while True:
+            now = time.monotonic()
+            wanted = streaming or preview_requested()
+            if wanted:
+                last_wanted = now
+            if wanted and not cam and now >= retry_at:
+                cam = subprocess.Popen(camera_cmd(setup), stdout=subprocess.PIPE)
+                os.set_blocking(cam.stdout.fileno(), False)
+                poller.register(cam.stdout, select.POLLIN | select.POLLHUP)
+                write_status(setup, "live")
+            if not wanted and cam and now - last_wanted >= IDLE_GRACE:
+                stop_cam()
+
+            for fd, ev in poller.poll(200):
+                if fd == out:
+                    n = readers(out)
+                    if n is not None:
+                        streaming = n > 0
+                elif cam and fd == cam.stdout.fileno():
+                    chunk = os.read(fd, 1 << 20) if ev & select.POLLIN else b""
+                    if not chunk:
+                        # camera busy (another app holds it) or unplugged
+                        stop_cam()
+                        retry_at = time.monotonic() + 2
+                        continue
+                    pending += chunk
+                    while len(pending) >= setup.frame:
+                        os.write(out, pending[:setup.frame])
+                        pending = pending[setup.frame:]
+
+            if not cam:
+                os.write(out, placeholder)   # keeps the device listed; ~5 fps
+    finally:
+        stop_cam()
+        for path in (STATUS, PREVIEW):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+
+# --- setup and diagnostics ---------------------------------------------------
+
+UNIT_FILE = os.path.join(HOME, ".config", "systemd", "user", f"{UNIT}.service")
+MODPROBE_CONF = "/etc/modprobe.d/camframe-v4l2loopback.conf"
+MODULES_CONF = "/etc/modules-load.d/camframe-v4l2loopback.conf"
+
+
+def sudo(cmd, input=None):
+    print("  $ sudo " + " ".join(cmd))
+    subprocess.run(["sudo"] + cmd, input=input, text=True, check=True,
+                   stdout=subprocess.DEVNULL if input is not None else None)
+
+
+def setup_cmd():
+    label = config().get("label", DEFAULT_LABEL)
+    have_loopback = Setup().dst is not None
+    packages = [p for p in ("v4l2loopback-dkms", "python-pyzmq", "v4l-utils", "ffmpeg")
+                if subprocess.run(["pacman", "-Q", p], capture_output=True).returncode != 0]
+    print("camframe setup\n")
+    if packages or not have_loopback:
+        print("Root steps (sudo will ask for your password):")
+        if packages:
+            print(f"  - install {', '.join(packages)} (v4l2loopback is built with DKMS for your kernel)")
+        if not have_loopback:
+            print(f"  - create a virtual camera named \"{label}\": {MODPROBE_CONF},")
+            print(f"    load it at boot: {MODULES_CONF}, and load it now")
+            print("    (if v4l2loopback is already loaded for another app, unload it first or set")
+            print("     \"loopback\" in ~/.config/camframe/config.json)")
+        if input("\nContinue? [y/N] ").strip().lower() != "y":
+            sys.exit("aborted")
+        if packages:
+            sudo(["pacman", "-S", "--needed", "--noconfirm"] + packages)
+        if not have_loopback:
+            sudo(["tee", MODPROBE_CONF],
+                 input=f'options v4l2loopback devices=1 video_nr=10 card_label="{label}" '
+                       f'exclusive_caps=1 max_buffers=2\n')
+            sudo(["tee", MODULES_CONF], input="v4l2loopback\n")
+            sudo(["modprobe", "v4l2loopback"])
+
+    print("\nUser steps:")
+    os.makedirs(os.path.dirname(UNIT_FILE), exist_ok=True)
+    with open(UNIT_FILE, "w") as f:
+        f.write(f"""[Unit]
+Description=camframe - framed virtual camera (opens the real camera on demand)
+After=graphical-session.target
+
+[Service]
+ExecStart={SCRIPT} run
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
+""")
+    print(f"  - wrote {UNIT_FILE}")
+    link = os.path.join(HOME, ".local", "bin", "camframe")
+    if not os.path.exists(link) or os.path.islink(link):
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        if os.path.islink(link):
+            os.remove(link)
+        os.symlink(SCRIPT, link)
+        print(f"  - linked {link} -> {SCRIPT}")
+    else:
+        print(f"  - left existing {link} alone (not a symlink)")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", UNIT], check=True)
+    print("  - enabled and started camframe.service\n")
+    doctor()
+
+
+def usb_path(sysdev):
+    """USB port path (e.g. '3-2.3') of a sysfs device, or None."""
+    for part in reversed(os.path.realpath(sysdev).split("/")):
+        if re.fullmatch(r"\d+-[\d.]+", part):
+            return part
+    return None
+
+
+def doctor():
+    s = Setup()
+    ok = lambda b: "ok  " if b else "FAIL"
+    print(f"[{ok(s.src)}] camera:   {s.src or 'none found'}" + (f"  ({video_name(s.src)})" if s.src else ""))
+    if s.src:
+        print(f"       mode:     {s.fmt} {s.in_w}x{s.in_h} -> {s.out_w}x{s.out_h}")
+    print(f"[{ok(s.dst)}] virtual:  {s.dst or 'not found - run `camframe setup`'}" + (f"  ({s.label})" if s.dst else ""))
+    try:
+        import zmq  # noqa: F401
+        zmq_ok = True
+    except ImportError:
+        zmq_ok = False
+    print(f"[{ok(zmq_ok)}] pyzmq:    {'installed' if zmq_ok else 'missing - install python-pyzmq'}")
+    print(f"[{ok(running())}] service:  camframe.service {'running' if running() else 'not running'}")
+    try:
+        with open(STATUS) as f:
+            print(f"       state:    {json.load(f)['state']}")
+    except Exception:
+        pass
+
+    # USB audio interfaces behind the same hub as the camera share its bandwidth
+    if not s.src:
+        return
+    cam_port = usb_path(f"/sys/class/video4linux/{os.path.basename(os.path.realpath(s.src))}")
+    hub = cam_port.rsplit(".", 1)[0] if cam_port and "." in cam_port else None
+    shared = []
+    for card in glob.glob("/sys/class/sound/card*"):
+        port = usb_path(card)
+        if hub and port and port != cam_port and port.startswith(hub + "."):
+            try:
+                with open(f"{card}/id") as f:
+                    shared.append(f"{f.read().strip()} ({port})")
+            except OSError:
+                shared.append(port)
+    if shared:
+        print(f"[warn] USB audio behind the camera's hub ({hub}): {', '.join(shared)}")
+        print("       The camera's video stream can starve it; plug the audio interface into")
+        print("       a port directly on the computer if you hear dropouts.")
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def main(argv):
+    cmd = argv[0] if argv else "status"
+    arg = argv[1] if len(argv) > 1 else ""
+    if cmd == "run":
+        run()
+    elif cmd == "setup":
+        setup_cmd()
+    elif cmd == "doctor":
+        doctor()
+    elif cmd == "start":
+        subprocess.run(["systemctl", "--user", "start", UNIT], check=False)
+        notify("Framed camera available")
+    elif cmd == "stop":
+        subprocess.run(["systemctl", "--user", "stop", UNIT], check=False)
+        notify("Framed camera off")
+    elif cmd == "toggle":
+        main(["stop" if running() else "start"])
+    elif cmd == "status":
+        st = load()
+        print(f"{'running' if running() else 'stopped'}  zoom={st['zoom']:.2f} "
+              f"center=({st['cx']:.2f},{st['cy']:.2f}) crop={Setup().geometry(st)}")
+    elif cmd == "preview":
+        os.makedirs(RUNDIR, exist_ok=True)
+        with open(PREVIEW_REQ, "a"):
+            os.utime(PREVIEW_REQ)
+    elif cmd in ("set", "zoom", "pan", "reset"):
+        setup = Setup()
+        old = load()
+        new = dict(old)
+        if cmd == "set":
+            new = {"zoom": float(argv[1]), "cx": float(argv[2]), "cy": float(argv[3])}
+        elif cmd == "reset" or arg == "reset":
+            new = dict(DEFAULT)
+        elif cmd == "zoom":
+            new["zoom"] = old["zoom"] * (ZOOM_STEP if arg == "in" else 1 / ZOOM_STEP)
+        else:
+            d = PAN_STEP / old["zoom"]
+            # left/right as seen in a mirrored self-view (call apps, bar widget)
+            dx, dy = {"left": (d, 0), "right": (-d, 0), "up": (0, -d), "down": (0, d)}[arg]
+            new["cx"] += dx
+            new["cy"] += dy
+        new["zoom"] = min(max(new["zoom"], ZOOM_MIN), ZOOM_MAX)
+        setup.clamp_center(new)
+        apply(setup, old, new, animate=cmd != "set")
+        if cmd in ("zoom", "reset"):
+            notify(f"Zoom {new['zoom']:.1f}×")
+    else:
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

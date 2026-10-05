@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "vk.camframe",
+  "name": "Camera framing",
+  "version": "1.0.0",
+  "author": "vk",
+  "license": "MIT",
+  "description": "Zoom and reframe any USB webcam like macOS camera framing: a virtual camera that crops the real one, with a live preview and draggable frame in the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Camera framing",
+    "description": "Live camera preview with a draggable frame and zoom slider for the framed virtual camera.",
+    "category": "Media",
+    "aliases": ["camera", "webcam", "zoom", "framing", "center stage"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "mirrorPreview": true
+    },
+    "schema": [
+      {
+        "key": "mirrorPreview",
+        "type": "boolean",
+        "label": "Mirror preview (like a self-view)",
+        "defaultValue": true
+      }
+    ]
+  }
+}
