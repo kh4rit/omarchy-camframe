@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "id": "vk.camframe",
+  "id": "kh4rit.camframe",
   "name": "Camera framing",
   "version": "1.0.0",
-  "author": "vk",
+  "author": "Vasilii Kharitonov",
   "license": "MIT",
   "description": "Zoom and reframe any USB webcam like macOS camera framing: a virtual camera that crops the real one, with a live preview and draggable frame in the bar.",
   "kinds": [

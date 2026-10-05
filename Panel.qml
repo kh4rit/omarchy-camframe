@@ -12,8 +12,8 @@ import qs.Ui
 // `camframe set`.
 Panel {
   id: root
-  moduleName: "vk.camframe"
-  ipcTarget: "vk.camframe"
+  moduleName: "kh4rit.camframe"
+  ipcTarget: "kh4rit.camframe"
 
   readonly property string camframe: decodeURIComponent(Qt.resolvedUrl("camframe").toString().replace(/^file:\/\//, ""))
   readonly property string runDir: Quickshell.env("XDG_RUNTIME_DIR") + "/camframe"

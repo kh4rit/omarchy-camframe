@@ -19,8 +19,8 @@ outlined: drag the frame to move it, scroll or use the slider to zoom.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/<you>/omarchy-camframe.git --enable
-~/.config/omarchy/plugins/vk.camframe/camframe setup
+omarchy plugin add https://github.com/kh4rit/omarchy-camframe.git --enable
+~/.config/omarchy/plugins/kh4rit.camframe/camframe setup
 ```
 
 `camframe setup` lists what it will do and asks before using `sudo`:
@@ -105,7 +105,7 @@ Restart the service after changes: `systemctl --user restart camframe`.
   already loaded with other options, `camframe setup` can't add its device.
   Load one module with several devices, or set `loopback` to the device camframe
   should use.
-- **Updating the plugin.** After `omarchy plugin update vk.camframe`, run
+- **Updating the plugin.** After `omarchy plugin update kh4rit.camframe`, run
   `omarchy restart shell` so the bar loads the new widget, and
   `systemctl --user restart camframe` for the service.
 
@@ -114,7 +114,7 @@ Restart the service after changes: `systemctl --user restart camframe`.
 ```bash
 systemctl --user disable --now camframe
 rm ~/.config/systemd/user/camframe.service ~/.local/bin/camframe
-omarchy plugin remove vk.camframe
+omarchy plugin remove kh4rit.camframe
 sudo rm /etc/modprobe.d/camframe-v4l2loopback.conf /etc/modules-load.d/camframe-v4l2loopback.conf
 sudo modprobe -r v4l2loopback   # optional
 ```
